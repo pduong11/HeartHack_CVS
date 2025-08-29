@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "stm32l4xx_hal.h"
+#include "stm32l4xx_hal_uart.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -44,21 +44,21 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart1;		// UFM-01 (flow sensor)
+UART_HandleTypeDef huart2;		// PC/VCP
 
 /* USER CODE BEGIN PV */
-UART_HandleTypeDef huart1;	// UFM-01 (flow sensor)
-UART_HandleTypeDef huart2;	// PC/VCP
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-/* USER CODE BEGIN PFP */
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
-static void Error_Handler(void);
-static void MC_ADC1_Init(void);
+/* USER CODE BEGIN PFP */
+void Error_Handler(void);
+//static void MC_ADC1_Init(void);
 
 /* USER CODE END PFP */
 
@@ -81,54 +81,84 @@ static uint8_t cs_sum(const uint8_t*b, int n) {
 	return (uint8_t)(s & 0xFF);
 }
 
+// SANITY CHECK HELPER
+static void log_hex(uint8_t b) {
+    char s[6];
+    int n = snprintf(s, sizeof(s), "%02X ", b);
+    HAL_UART_Transmit(&huart2, (uint8_t*)s, n, 50);
+}
+
 // Look for tags and publish one line on USART2
-static void parse_and_publish(int stop_idx) {
-	if (stop_idx < 2) return;
-	uint8_t cs_calc = cs_sum(pkt, stop_idx);
-	uint8_t cs_rx = pkt[stop_idx - 1];
-	if (cs_calc != cs_rx) return;
+static void parse_and_publish(int n_bytes) {
+	if (n_bytes < 8) return;		// too short to be valid
 
-	// Find FLOW tag (0x0B) and TEMP tag (0x0D)
-	int flow_tag = -1, temp_tag = -1;
-	for (int i = 0; i + 5 < stop_idx && flow_tag < 0; ++i)
-		if (pkt[i] == 0x0B) flow_tag = i;
-	for (int i =0; i + 4 < stop_idx && temp_tag < 0; ++i)
-		if (pkt[i] == 0x0D) temp_tag = i;
+	// Stop byte and checksum positions depend on frame length
+	if (pkt[n_bytes - 1] != 0x16) return;		// must end with 0x16
 
-	float	flow_lph = NAN, temp_c = NAN;
-	uint16_t status = 0;
 
-	if (flow_tag >= 0 && flow_tag + 4 < stop_idx) {
-		// 4 bytes little-endian, then optional sign flag (0x80)
-		uint32_t uf = (uint32_t)pkt[flow_tag+1]
-					| ((uint32_t)pkt[flow_tag+2] << 8)
-					| ((uint32_t)pkt[flow_tag+3] << 16)
-					| ((uint32_t)pkt[flow_tag+4] << 24);
-		int32_t flow_raw = (int32_t)uf;
-		flow_lph = flow_raw / 100.0f;
-		if (flow_tag + 5 < stop_idx && pkt[flow_tag+5] == 0x80)
-			flow_lph = -flow_lph;
+	// Compute checksum over everything up to ST2 (the two status bytes before checksum)
+	// Checksum is byte 37 (before 0x16) and covers bytes 0..ST2
+	uint8_t cs_rx = pkt[n_bytes - 2];
+	uint8_t cs_calc = cs_sum(pkt, n_bytes - 2);
+	if (cs_rx != cs_calc) return;		// Bad checksum; ignore
+
+	// Verify header: 0x3C, second start byte is mode-dependent
+	if (pkt[0] != 0x3C) return;
+	uint8_t start2 = pkt[1];		// 0x32 (active), 0x96 (passive+ID), 0x64 (passive no-ID)
+
+	// Search tags: Acc Flow (0x0A, 0x1A), Inst Flow (0x0B), Temp (0x0D)
+	int acc_flag = -1, inst_flag = -1, temp_flag = -1;
+	for (int i = 0; i < n_bytes; ++i) {
+		// Accumulated flow flag can be 0x0A or 0x1A per fatasheet
+		if ((pkt[i] == 0x0A || pkt[i] == 0x1A) && acc_flag < 0) acc_flag = i;
+		if (pkt[i] == 0x0B && inst_flag < 0) inst_flag = i;
+		if (pkt[i] == 0x0D && temp_flag < 0) temp_flag = i;
 	}
 
-	if (temp_tag >= 0 && temp_tag + 3 < stop_idx) {
-		// 3 bytes little-endian
-		uint32_t ut = (uint32_t)pkt[temp_tag+1]
-					| ((uint32_t)pkt[temp_tag+2] << 8)
-					| ((uint32_t)pkt[temp_tag+3] << 16);
-		temp_c = ut / 100.0f;
+	// Instant flow (0x0B): byte [i+1.. i+4] value LE, [i+5] sign/scale
+	float inst_lph = NAN;
+	if (inst_flag >= 0 && inst_flag + 5 < n_bytes) {
+		uint32_t v = (uint32_t)pkt[inst_flag+1]
+					| ((uint32_t)pkt[inst_flag+2] << 8)
+					| ((uint32_t)pkt[inst_flag+3] << 16)
+					| ((uint32_t)pkt[inst_flag+4] << 24);
+		uint8_t sign_scale = pkt[inst_flag+5];
+		// LSB = 0.01 L/h; sign bit (Bit7) indicates negative when set
+		float f = (float)v * 0.01f;
+		if (sign_scale & 0x80) f = -f;
+		inst_lph = f;
 	}
 
-	// Fallback status: last two bytes before CS (common placement)
-	if (stop_idx >= 3) {
-		status = (uint16_t)pkt[stop_idx - 3] | ((uint16_t)pkt[stop_idx - 2] << 8);
+	// Temperature (0x0D): next 3 bytes LE, value / 100 degC
+	float temp_c = NAN;
+	if (temp_flag >= 0 && temp_flag + 3 < n_bytes) {
+		uint32_t t = (uint32_t)pkt[temp_flag+1]
+					| ((uint32_t)pkt[temp_flag+2] << 8)
+					| ((uint32_t)pkt[temp_flag+3] << 16);
+		temp_c = (float)t / 100.0f;
 	}
 
-	char line[96];
+	// Accumulated flow: 6 bytes (4B value LE, then 2 bytes LSB/mode)
+	// Only decode the 4B numeric part for display in liters or m^3 depending on flag
+	double acc_val = NAN;
+	if (acc_flag >=0 && acc_flag + 6 < n_bytes) {
+		uint32_t v = (uint32_t)pkt[acc_flag+1]
+					| ((uint32_t)pkt[acc_flag+2] << 8)
+					| ((uint32_t)pkt[acc_flag+3] << 16)
+					| ((uint32_t)pkt[acc_flag+4] << 24);
+		// LSB shown: 0.001 L if flag 0x0A, 0.001 m^3 if 0x1A
+		if (pkt[acc_flag] == 0x0A)	acc_val = (double)v * 0.001;	//litres
+		else /*0x1A*/				acc_val = (double)v * 0.001;	//m^3
+	}
+
+	char line[128];
 	int n = snprintf(line, sizeof(line),
-			"FLOW=%s, TEMP=%s, STAT=%04X\r\n",
-			isnan(flow_lph) ? "NA" : ({ static char f[16]; snprintf(f, sizeof(f), "%.2f", flow_lph); f; }),
-			isnan(temp_c)	? "NA" : ({ static char t[16]; snprintf(t, sizeof(t), "%.2f", temp_c); t; }),
-			status);
+			"mode=%02X, inst=%.2f, temp=%s, acc=%s, len=%d\r\n",
+			start2,
+			isnan(inst_lph) ? NAN : inst_lph,
+			isnan(temp_c) ? "NA" : ({ static char tbuf[16]; snprintf(tbuf, sizeof(tbuf), "%.2fC", temp_c); tbuf; }),
+			isnan(acc_val)	? "NA" : ({ static char abuf[24]; snprintf(abuf, sizeof(abuf), "%.3f", acc_val); abuf; }),
+			n_bytes);
 
 	HAL_UART_Transmit(&huart2, (uint8_t*)line, n, 50);
 }
@@ -137,23 +167,40 @@ static void parse_and_publish(int stop_idx) {
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart->Instance == USART1) {
 		uint8_t b = rx_byte;
+		log_hex(b); 		//sanity check
 
 		if (pkt_len < (int)sizeof(pkt)) {
 			pkt[pkt_len++] = b;
 
 			// Parse on STOP 0x16 or if buffer too long (resync)
-			if (b == 0x16) {
-				parse_and_publish(pkt_len - 1);
+			if (b == 0x16) {					// Stop byte per datasheet
+				parse_and_publish(pkt_len);		// pkt_len = total bytes incl 0x16
 				pkt_len = 0;
-			} else if (pkt_len >= 64) {
-				pkt_len = 0;	// no STOP seem -> resync
+			} else if (pkt_len >= (int)sizeof(pkt) - 1) {
+				pkt_len = 0;					// overflow -> resync
 			}
 		} else {
 			pkt_len = 0;
 		}
 
 		// Re-arm for next byte
+		HAL_UART_Receive_IT(&huart1, &rx_byte, 1);	// re-arm
+	}
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+	if (huart->Instance == USART1) {
+		uint32_t err = HAL_UART_GetError(huart);
+		// Clear common error flags (PE/FE/NE/ORE)
+		__HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_PEF | UART_CLEAR_FEF | UART_CLEAR_NEF | UART_CLEAR_OREF);
+
+		// Re-arm single-byte RX
 		HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+
+		// Print error to PC
+		char msg[48];
+		int n = snprintf(msg, sizeof(msg), "UART1 ERR=%081X\r\n", err);
+		HAL_UART_Transmit(&huart2, (uint8_t*)msg, n, 50);
 	}
 }
 
@@ -187,15 +234,18 @@ int main(void)
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
-  /* USER CODE BEGIN 2 */
   MX_GPIO_Init();
-  MX_USART1_UART_Init();	// UFM-01 @ 2400 8E1
-  MX_USART2_UART_Init();	// PC log @ 115200 8N1
+  MX_USART1_UART_Init();		// UFM-01 @ 2400 8E1
+  MX_USART2_UART_Init();		// PC log @ 115200 8N1
+
+  /* USER CODE BEGIN 2 */
 
  // Start IRQ receive from sensor
   HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
   const char *banner = "NUCLEO-L432KC UFM-01 bridge ready\r\n";
+//  const char *hb = "HB\r\n";
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);	// start RX first
   HAL_UART_Transmit(&huart2, (uint8_t*)banner, strlen(banner), 50);
   /* USER CODE END 2 */
 
@@ -205,13 +255,14 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
+	  // HAL_UART_Transmit(&huart2, (uint8_t*)hb, 4, 50);		// sanity check
+	  // HAL_Delay(500);
+
 	uint32_t now = HAL_GetTick();
 	if (now - last_poll_ms >= 250) {		// poll ~4Hz
 		last_poll_ms = now;
 		HAL_UART_Transmit(&huart1, (uint8_t*)UFM_READ_CMD, sizeof(UFM_READ_CMD), 20);
 	}
-
-	// READ COMMANDS FROM PC ON USART2 HERE IF NEEDED
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -261,19 +312,20 @@ void SystemClock_Config(void)
   }
 }
 
-/* USER CODE BEGIN 4 */
-static void MX_GPIO_Init(void)
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
 {
-	__HAL_RCC_GPIOA_CLK_ENABLE();
-	// No user GPIO required; UART pins configured in their init functions
-}
 
-
-static void MX_USART1_Init(void)
-{
+  /* USER CODE BEGIN USART1_Init 0 */
 	__HAL_RCC_USART1_CLK_ENABLE();
 	__HAL_RCC_GPIOA_CLK_ENABLE();
+  /* USER CODE END USART1_Init 0 */
 
+  /* USER CODE BEGIN USART1_Init 1 */
 	// PA9 = USART1_TX (AF7), PA10 = USART1_RX (AF7)
 	GPIO_InitTypeDef GPIO_InitStruct = {0};
 	GPIO_InitStruct.Pin			= GPIO_PIN_9;
@@ -290,26 +342,46 @@ static void MX_USART1_Init(void)
 	GPIO_InitStruct.Alternate	= GPIO_AF7_USART1;
 	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-	huart1.Instance				= USART1;
-	huart1.Init.BaudRate		= 2400;
-	huart1.Init.WordLength		= UART_WORDLENGTH_9B;		// 8 data + parity
-	huart1.Init.StopBits		= UART_STOPBITS_1;
-	huart1.Init.Parity			= UART_PARITY_EVEN;			// 8E1
-	huart1.Init.Mode			= UART_MODE_TX_RX;
-	huart1.Init.HwFlowCtl		= UART_HWCONTROL_NONE;
-	huart1.Init.OverSampling	= UART_OVERSAMPLING_16;
-	if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
-
 	// Enable IRQ for interrupt-driven RX
 	HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
 	HAL_NVIC_EnableIRQ(USART1_IRQn);
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 2400;
+  huart1.Init.WordLength = UART_WORDLENGTH_9B;				// 8 data + parity
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_EVEN;					// 8E1
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;  	//HEllo
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
 }
 
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART2_UART_Init(void)
 {
+
+  /* USER CODE BEGIN USART2_Init 0 */
 	__HAL_RCC_USART2_CLK_ENABLE();
 	__HAL_RCC_GPIOA_CLK_ENABLE();
 
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
 	// PA2 = USART2_TX (AF7), PA15 = USART2_RX (AF3)
 	GPIO_InitTypeDef GPIO_InitStruct = {0};
 	GPIO_InitStruct.Pin			= GPIO_PIN_2;
@@ -326,16 +398,47 @@ static void MX_USART2_UART_Init(void)
 	GPIO_InitStruct.Alternate	= GPIO_AF3_USART2;
 	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-	huart2.Instance				= USART2;
-	huart2.Init.BaudRate		= 115200;
-	huart2.Init.WordLength		= UART_WORDLENGTH_8B;
-	huart2.Init.StopBits		= UART_STOPBITS_1;
-	huart2.Init.Parity			= UART_PARITY_NONE;		// 8N1
-	huart2.Init.Mode			= UART_MODE_TX_RX;
-	huart2.Init.HwFlowCtl		= UART_HWCONTROL_NONE;
-	huart2.Init.OverSampling	= UART_OVERSAMPLING_16;
-	if (HAL_UART_Init(&huart2) != HAL_OK) { Error_Handler(); }
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;				// 8N1
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;		//Hello
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
 }
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();		// No user GPIO required; UART pins configured in their init functions
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
 
