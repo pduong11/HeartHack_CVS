@@ -64,37 +64,38 @@ void Error_Handler(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+volatile uint32_t rx_isr_count = 0;
 
 // UFM-01: Read (no ID) command
-static const uint8_t UFM_READ_CMD[7] = {0xFE, 0xFE, 0x11, 0x5B, 0x0F, 0x6A, 0x16};
+static const uint8_t UFM_CMD_ACTIVE[7]  = {0xFE,0xFE,0x11,0x5C,0x00,0x5C,0x16}; // stream @1Hz
+//static const uint8_t UFM_CMD_PASSIVE[7] = {0xFE,0xFE,0x11,0x5C,0x01,0x5D,0x16}; // respond to reads
+//static const uint8_t UFM_READ_CMD[7]    = {0xFE,0xFE,0x11,0x5B,0x0F,0x6A,0x16}; // read (no ID)
 
 // RX / Parser State
 static uint8_t 	rx_byte;		// single-byte buffer fir IRQ RX
 static uint8_t 	pkt[96];		// frame buffer
 static int 		pkt_len = 0;
-static uint32_t	last_poll_ms = 0;
+
+// Print hand off from ISR -> Main
+static volatile bool line_ready = false;
+static char line_buf[128];
 
 // Helpers
-static uint8_t cs_sum(const uint8_t*b, int n) {
+static inline uint8_t cs_sum(const uint8_t*b, int n) {
 	uint32_t s = 0;
 	for (int i = 0; i < n; ++i) s += b[i];
 	return (uint8_t)(s & 0xFF);
 }
 
-// SANITY CHECK HELPER
-static void log_hex(uint8_t b) {
-    char s[6];
-    int n = snprintf(s, sizeof(s), "%02X ", b);
-    HAL_UART_Transmit(&huart2, (uint8_t*)s, n, 50);
+static inline uint32_t rd_le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
 }
 
 // Look for tags and publish one line on USART2
-static void parse_and_publish(int n_bytes) {
-	if (n_bytes < 8) return;		// too short to be valid
-
-	// Stop byte and checksum positions depend on frame length
-	if (pkt[n_bytes - 1] != 0x16) return;		// must end with 0x16
-
+static void parse_and_format(int n_bytes) {
+	if (n_bytes < 12) return;		// too short to be valid
+    if (pkt[0] != 0x3C) return;               // header
+    if (pkt[n_bytes-1] != 0x16) return;       // stop
 
 	// Compute checksum over everything up to ST2 (the two status bytes before checksum)
 	// Checksum is byte 37 (before 0x16) and covers bytes 0..ST2
@@ -102,14 +103,12 @@ static void parse_and_publish(int n_bytes) {
 	uint8_t cs_calc = cs_sum(pkt, n_bytes - 2);
 	if (cs_rx != cs_calc) return;		// Bad checksum; ignore
 
-	// Verify header: 0x3C, second start byte is mode-dependent
-	if (pkt[0] != 0x3C) return;
 	uint8_t start2 = pkt[1];		// 0x32 (active), 0x96 (passive+ID), 0x64 (passive no-ID)
 
 	// Search tags: Acc Flow (0x0A, 0x1A), Inst Flow (0x0B), Temp (0x0D)
 	int acc_flag = -1, inst_flag = -1, temp_flag = -1;
 	for (int i = 0; i < n_bytes; ++i) {
-		// Accumulated flow flag can be 0x0A or 0x1A per fatasheet
+		// Accumulated flow flag can be 0x0A or 0x1A per datasheet
 		if ((pkt[i] == 0x0A || pkt[i] == 0x1A) && acc_flag < 0) acc_flag = i;
 		if (pkt[i] == 0x0B && inst_flag < 0) inst_flag = i;
 		if (pkt[i] == 0x0D && temp_flag < 0) temp_flag = i;
@@ -118,14 +117,11 @@ static void parse_and_publish(int n_bytes) {
 	// Instant flow (0x0B): byte [i+1.. i+4] value LE, [i+5] sign/scale
 	float inst_lph = NAN;
 	if (inst_flag >= 0 && inst_flag + 5 < n_bytes) {
-		uint32_t v = (uint32_t)pkt[inst_flag+1]
-					| ((uint32_t)pkt[inst_flag+2] << 8)
-					| ((uint32_t)pkt[inst_flag+3] << 16)
-					| ((uint32_t)pkt[inst_flag+4] << 24);
+		uint32_t v = rd_le32(&pkt[inst_flag+1]);
 		uint8_t sign_scale = pkt[inst_flag+5];
 		// LSB = 0.01 L/h; sign bit (Bit7) indicates negative when set
-		float f = (float)v * 0.01f;
-		if (sign_scale & 0x80) f = -f;
+		float f = (double)v * 0.01;			// LSB = 0.01 L/h
+		if (sign_scale & 0x80) f = -f;		// Negative if bit7 set
 		inst_lph = f;
 	}
 
@@ -133,60 +129,72 @@ static void parse_and_publish(int n_bytes) {
 	float temp_c = NAN;
 	if (temp_flag >= 0 && temp_flag + 3 < n_bytes) {
 		uint32_t t = (uint32_t)pkt[temp_flag+1]
-					| ((uint32_t)pkt[temp_flag+2] << 8)
-					| ((uint32_t)pkt[temp_flag+3] << 16);
-		temp_c = (float)t / 100.0f;
+					| ((uint32_t)pkt[temp_flag+2] << 8);
+					//| ((uint32_t)pkt[temp_flag+3] << 16);
+		temp_c = (double)t * 0.01;
 	}
 
 	// Accumulated flow: 6 bytes (4B value LE, then 2 bytes LSB/mode)
 	// Only decode the 4B numeric part for display in liters or m^3 depending on flag
 	double acc_val = NAN;
-	if (acc_flag >=0 && acc_flag + 6 < n_bytes) {
-		uint32_t v = (uint32_t)pkt[acc_flag+1]
-					| ((uint32_t)pkt[acc_flag+2] << 8)
-					| ((uint32_t)pkt[acc_flag+3] << 16)
-					| ((uint32_t)pkt[acc_flag+4] << 24);
+	if (acc_flag >=0 && acc_flag + 4 < n_bytes) {
+		uint32_t v = rd_le32(&pkt[acc_flag+1]);
 		// LSB shown: 0.001 L if flag 0x0A, 0.001 m^3 if 0x1A
 		if (pkt[acc_flag] == 0x0A)	acc_val = (double)v * 0.001;	//litres
 		else /*0x1A*/				acc_val = (double)v * 0.001;	//m^3
 	}
 
-	char line[128];
-	int n = snprintf(line, sizeof(line),
-			"mode=%02X, inst=%.2f, temp=%s, acc=%s, len=%d\r\n",
-			start2,
-			isnan(inst_lph) ? NAN : inst_lph,
-			isnan(temp_c) ? "NA" : ({ static char tbuf[16]; snprintf(tbuf, sizeof(tbuf), "%.2fC", temp_c); tbuf; }),
-			isnan(acc_val)	? "NA" : ({ static char abuf[24]; snprintf(abuf, sizeof(abuf), "%.3f", acc_val); abuf; }),
-			n_bytes);
+    // Status bytes are right before checksum: ST1= n-4, ST2= n-3
+    uint8_t st1 = (n_bytes >= 4) ? pkt[n_bytes-4] : 0;
+    uint8_t st2 = (n_bytes >= 3) ? pkt[n_bytes-3] : 0;
 
-	HAL_UART_Transmit(&huart2, (uint8_t*)line, n, 50);
+    // Build results line
+	char tbuf[16], abuf[24], ibuf[24];
+
+	// Temperature: either "NA" or "xx.xxC"
+	if (isnan(temp_c))	snprintf(tbuf, sizeof(tbuf), "NA");
+	else 				snprintf(tbuf, sizeof(tbuf), "%.2fC", temp_c);
+
+	// Accumulator: either "NA" or "xx.xxx"
+	if (isnan(acc_val))	snprintf(abuf, sizeof(abuf), "NA");
+	else {
+        if (acc_flag >= 0 && pkt[acc_flag] == 0x1A)	snprintf(abuf, sizeof(abuf), "%.3f m^3", acc_val);
+        else                                  		snprintf(abuf, sizeof(abuf), "%.3f L",   acc_val);
+    }
+
+    if (isnan(inst_lph)) snprintf(ibuf, sizeof(ibuf), "NA");
+    else                 snprintf(ibuf, sizeof(ibuf), "%.2f L/h", inst_lph);
+
+    int n = snprintf(line_buf, sizeof(line_buf),
+        "mode=%02X ST1=%02X ST2=%02X inst=%s temp=%s acc=%s len=%d\r\n",
+        (unsigned)start2, (unsigned)st1, (unsigned)st2, ibuf, tbuf, abuf, n_bytes);
+
+    if (n > 0) line_ready = true;
 }
 
 // HAL RX complete callback: re-arm and parse
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart->Instance == USART1) {
 		uint8_t b = rx_byte;
-		log_hex(b); 		//sanity check
+		//log_hex(b); 		//sanity check
+		//rx_isr_count++;                    // count ISR hits (no printing here)
 
 		if (pkt_len < (int)sizeof(pkt)) {
 			pkt[pkt_len++] = b;
-
 			// Parse on STOP 0x16 or if buffer too long (resync)
 			if (b == 0x16) {					// Stop byte per datasheet
-				parse_and_publish(pkt_len);		// pkt_len = total bytes incl 0x16
+				parse_and_format(pkt_len);		// pkt_len = total bytes incl 0x16
 				pkt_len = 0;
-			} else if (pkt_len >= (int)sizeof(pkt) - 1) {
-				pkt_len = 0;					// overflow -> resync
 			}
 		} else {
-			pkt_len = 0;
+			pkt_len = 0;						// overflow -> resync
 		}
 
 		// Re-arm for next byte
 		HAL_UART_Receive_IT(&huart1, &rx_byte, 1);	// re-arm
 	}
 }
+
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
 	if (huart->Instance == USART1) {
@@ -199,7 +207,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
 
 		// Print error to PC
 		char msg[48];
-		int n = snprintf(msg, sizeof(msg), "UART1 ERR=%081X\r\n", err);
+		int n = snprintf(msg, sizeof(msg), "UART1 ERR=%08X\r\n", (unsigned int)err);
 		HAL_UART_Transmit(&huart2, (uint8_t*)msg, n, 50);
 	}
 }
@@ -239,13 +247,18 @@ int main(void)
   MX_USART2_UART_Init();		// PC log @ 115200 8N1
 
   /* USER CODE BEGIN 2 */
+  // Start IRQ receive from sensor
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1); // start RX first
 
- // Start IRQ receive from sensor
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  // Force ACTIVE streaming (once at boot) --- Change to UFM_CMD_PASSIVE for passive mode, also uncomment polling
+  HAL_UART_Transmit(&huart1, (uint8_t*)UFM_CMD_ACTIVE, sizeof(UFM_CMD_ACTIVE), 50);
 
-  const char *banner = "NUCLEO-L432KC UFM-01 bridge ready\r\n";
-//  const char *hb = "HB\r\n";
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);	// start RX first
+
+
+
+   const char *banner = "NUCLEO-L432KC UFM-01 bridge ready\r\n";
+  //const char *hb = "HB\r\n";
+
   HAL_UART_Transmit(&huart2, (uint8_t*)banner, strlen(banner), 50);
   /* USER CODE END 2 */
 
@@ -255,17 +268,23 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-	  // HAL_UART_Transmit(&huart2, (uint8_t*)hb, 4, 50);		// sanity check
-	  // HAL_Delay(500);
-
-	uint32_t now = HAL_GetTick();
-	if (now - last_poll_ms >= 250) {		// poll ~4Hz
-		last_poll_ms = now;
-		HAL_UART_Transmit(&huart1, (uint8_t*)UFM_READ_CMD, sizeof(UFM_READ_CMD), 20);
-	}
     /* USER CODE BEGIN 3 */
-  }
+	// HAL_UART_Transmit(&huart2, (uint8_t*)hb, 4, 50);		// sanity check
+	if (line_ready) {
+		line_ready = false;
+		HAL_UART_Transmit(&huart2, (uint8_t*)line_buf, (uint16_t)strlen(line_buf), 100);
+	}
+
+    // --- Passive mode example (uncomment only if you forced passive) ---
+    // static uint32_t last_poll = 0;
+    // if (HAL_GetTick() - last_poll >= 1000) { // 1 Hz
+    //     last_poll = HAL_GetTick();
+    //     HAL_UART_Transmit(&huart1, (uint8_t*)UFM_READ_CMD, sizeof(UFM_READ_CMD), 50);
+    // }
+
+    HAL_Delay(5);
   /* USER CODE END 3 */
+  }
 }
 
 /**
@@ -306,10 +325,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)	Error_Handler();
 }
 
 /**
