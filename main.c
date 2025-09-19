@@ -48,7 +48,28 @@ UART_HandleTypeDef huart1;		// UFM-01 (flow sensor)
 UART_HandleTypeDef huart2;		// PC/VCP
 
 /* USER CODE BEGIN PV */
+// UFM-01: Read (no ID) command
+static const uint8_t UFM_CMD_ACTIVE[7]  = {0xFE,0xFE,0x11,0x5C,0x00,0x5C,0x16}; // stream @1Hz
+//static const uint8_t UFM_CMD_PASSIVE[7] = {0xFE,0xFE,0x11,0x5C,0x01,0x5D,0x16}; // respond to reads
+//static const uint8_t UFM_READ_CMD[7]    = {0xFE,0xFE,0x11,0x5B,0x0F,0x6A,0x16}; // read (no ID)
 
+// RX / Parser State
+static uint8_t 	rx_byte;		// single-byte buffer fir IRQ RX
+static uint8_t 	pkt[128];		// frame buffer
+static int 		pkt_len = 0;
+
+// ISR -> Main handoff
+static volatile bool pkt_ready = false;
+static int 			 pkt_len_copied = 0;
+static uint8_t 		 pkt_copy[128];
+
+// Print hand off to PC
+static volatile bool line_ready = false;
+static char 		 line_buf[128];
+
+// Error reporting (printed from main)
+static volatile bool 	 err_flag = false;
+static volatile uint32_t last_err = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -60,96 +81,102 @@ static void MX_USART2_UART_Init(void);
 void Error_Handler(void);
 //static void MC_ADC1_Init(void);
 
+static inline uint8_t cs_sum(const uint8_t*b, int n);
+static bool bcd_le_bytes_to_uint64(const uint8_t *p, size_t nbytes, uint64_t *out);
+static void parse_and_format(const uint8_t *buf, int n_bytes);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-volatile uint32_t rx_isr_count = 0;
 
-// UFM-01: Read (no ID) command
-static const uint8_t UFM_CMD_ACTIVE[7]  = {0xFE,0xFE,0x11,0x5C,0x00,0x5C,0x16}; // stream @1Hz
-//static const uint8_t UFM_CMD_PASSIVE[7] = {0xFE,0xFE,0x11,0x5C,0x01,0x5D,0x16}; // respond to reads
-//static const uint8_t UFM_READ_CMD[7]    = {0xFE,0xFE,0x11,0x5B,0x0F,0x6A,0x16}; // read (no ID)
-
-// RX / Parser State
-static uint8_t 	rx_byte;		// single-byte buffer fir IRQ RX
-static uint8_t 	pkt[96];		// frame buffer
-static int 		pkt_len = 0;
-
-// Print hand off from ISR -> Main
-static volatile bool line_ready = false;
-static char line_buf[128];
-
-// Helpers
 static inline uint8_t cs_sum(const uint8_t*b, int n) {
-	uint32_t s = 0;
-	for (int i = 0; i < n; ++i) s += b[i];
+	uint32_t s=0;
+	for (int i=0; i<n; ++i) s += b[i];
 	return (uint8_t)(s & 0xFF);
 }
 
-static inline uint32_t rd_le32(const uint8_t* p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+
+// Decode packed-BCD stored in little-endian bytes order
+// Each byte is two digits: [hi-nibble][lo-nibble]. Returns false if any nibble is >9
+// Example: bytes {0x89, 0x67, 0x45, 0x23} => digits "23 45 67 87"
+static bool bcd_le_bytes_to_uint64(const uint8_t *p, size_t nbytes, uint64_t *out) {
+	uint64_t v = 0;
+	// process from most-significant byte down to the least significant byte
+	for (size_t i = 0; i < nbytes; ++i) {
+		uint8_t b = p[nbytes - 1 - i]; 		// reverse byte order
+		uint8_t hi = (b>>4) & 0xF;
+		uint8_t lo = b & 0xF;
+		if (hi > 9 || lo > 9) return false; // Not a valid BCD
+		v = v * 10 + hi;
+		v = v * 10 + lo;
+	}
+	*out = v;
+	return true;
 }
 
 // Look for tags and publish one line on USART2
-static void parse_and_format(int n_bytes) {
+static void parse_and_format(const uint8_t *buf, int n_bytes) {
 	if (n_bytes < 12) return;		// too short to be valid
-    if (pkt[0] != 0x3C) return;               // header
-    if (pkt[n_bytes-1] != 0x16) return;       // stop
+    if (buf[0] != 0x3C) return;               // header
+    if (buf[n_bytes-1] != 0x16) return;       // stop
 
 	// Compute checksum over everything up to ST2 (the two status bytes before checksum)
 	// Checksum is byte 37 (before 0x16) and covers bytes 0..ST2
-	uint8_t cs_rx = pkt[n_bytes - 2];
-	uint8_t cs_calc = cs_sum(pkt, n_bytes - 2);
+	uint8_t cs_rx = buf[n_bytes - 2];
+	uint8_t cs_calc = cs_sum(buf, n_bytes - 2);
 	if (cs_rx != cs_calc) return;		// Bad checksum; ignore
 
-	uint8_t start2 = pkt[1];		// 0x32 (active), 0x96 (passive+ID), 0x64 (passive no-ID)
+	uint8_t start2 = buf[1];		// 0x32 (active), 0x96 (passive+ID), 0x64 (passive no-ID)
 
 	// Search tags: Acc Flow (0x0A, 0x1A), Inst Flow (0x0B), Temp (0x0D)
 	int acc_flag = -1, inst_flag = -1, temp_flag = -1;
 	for (int i = 0; i < n_bytes; ++i) {
 		// Accumulated flow flag can be 0x0A or 0x1A per datasheet
-		if ((pkt[i] == 0x0A || pkt[i] == 0x1A) && acc_flag < 0) acc_flag = i;
-		if (pkt[i] == 0x0B && inst_flag < 0) inst_flag = i;
-		if (pkt[i] == 0x0D && temp_flag < 0) temp_flag = i;
+		if ((buf[i] == 0x0A || buf[i] == 0x1A) && acc_flag < 0) acc_flag = i;
+		if (buf[i] == 0x0B && inst_flag < 0) inst_flag = i;
+		if (buf[i] == 0x0D && temp_flag < 0) temp_flag = i;
 	}
 
 	// Instant flow (0x0B): byte [i+1.. i+4] value LE, [i+5] sign/scale
 	float inst_lph = NAN;
 	if (inst_flag >= 0 && inst_flag + 5 < n_bytes) {
-		uint32_t v = rd_le32(&pkt[inst_flag+1]);
-		uint8_t sign_scale = pkt[inst_flag+5];
-		// LSB = 0.01 L/h; sign bit (Bit7) indicates negative when set
-		float f = (double)v * 0.01;			// LSB = 0.01 L/h
-		if (sign_scale & 0x80) f = -f;		// Negative if bit7 set
-		inst_lph = f;
+		uint64_t val;
+		if (bcd_le_bytes_to_uint64(&buf[inst_flag + 1], 4, &val)) {
+			// two fixed fractional digits -> LSB = 0.01 L/h
+			float f = (double)val /100.0;
+			uint8_t sign_status = buf[inst_flag + 5];
+			if (sign_status & 0x80) f = -f;		// Bit20 = negative
+			inst_lph = (float)f;
+		}
 	}
 
 	// Temperature (0x0D): next 3 bytes LE, value / 100 degC
 	float temp_c = NAN;
 	if (temp_flag >= 0 && temp_flag + 3 < n_bytes) {
-		uint32_t t = (uint32_t)pkt[temp_flag+1]
-					| ((uint32_t)pkt[temp_flag+2] << 8);
-					//| ((uint32_t)pkt[temp_flag+3] << 16);
-		temp_c = (double)t * 0.01;
+		uint64_t val;
+		if (bcd_le_bytes_to_uint64(&buf[temp_flag+1], 3, &val)) {
+			temp_c = (float)((double)val*0.01); // degrees Celsius
+		}
 	}
 
-	// Accumulated flow: 6 bytes (4B value LE, then 2 bytes LSB/mode)
+	// Accumulated flow: 6 bytes
 	// Only decode the 4B numeric part for display in liters or m^3 depending on flag
-	double acc_val = NAN;
-	if (acc_flag >=0 && acc_flag + 4 < n_bytes) {
-		uint32_t v = rd_le32(&pkt[acc_flag+1]);
-		// LSB shown: 0.001 L if flag 0x0A, 0.001 m^3 if 0x1A
-		if (pkt[acc_flag] == 0x0A)	acc_val = (double)v * 0.001;	//litres
-		else /*0x1A*/				acc_val = (double)v * 0.001;	//m^3
+	float acc_val = NAN;
+	const char *acc_unit = "";
+	if (acc_flag >=0 && acc_flag + 6 < n_bytes) {
+		uint64_t val;
+		if (bcd_le_bytes_to_uint64(&buf[acc_flag+1], 6, &val)) {
+			acc_val = (float)((double)val*0.001);
+			acc_unit = (buf[acc_flag]==0x1A) ? "m^3" : "L";
+		}
 	}
 
     // Status bytes are right before checksum: ST1= n-4, ST2= n-3
-    uint8_t st1 = (n_bytes >= 4) ? pkt[n_bytes-4] : 0;
-    uint8_t st2 = (n_bytes >= 3) ? pkt[n_bytes-3] : 0;
+    uint8_t st1 = (n_bytes >= 4) ? buf[n_bytes-4] : 0;
+    uint8_t st2 = (n_bytes >= 3) ? buf[n_bytes-3] : 0;
 
     // Build results line
-	char tbuf[16], abuf[24], ibuf[24];
+	char tbuf[24], abuf[32], ibuf[24];
 
 	// Temperature: either "NA" or "xx.xxC"
 	if (isnan(temp_c))	snprintf(tbuf, sizeof(tbuf), "NA");
@@ -157,11 +184,9 @@ static void parse_and_format(int n_bytes) {
 
 	// Accumulator: either "NA" or "xx.xxx"
 	if (isnan(acc_val))	snprintf(abuf, sizeof(abuf), "NA");
-	else {
-        if (acc_flag >= 0 && pkt[acc_flag] == 0x1A)	snprintf(abuf, sizeof(abuf), "%.3f m^3", acc_val);
-        else                                  		snprintf(abuf, sizeof(abuf), "%.3f L",   acc_val);
-    }
+	else 				snprintf(abuf, sizeof(abuf), "%.3f %s", acc_val, acc_unit);
 
+	// Instantaneous flow
     if (isnan(inst_lph)) snprintf(ibuf, sizeof(ibuf), "NA");
     else                 snprintf(ibuf, sizeof(ibuf), "%.2f L/h", inst_lph);
 
@@ -183,8 +208,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 			pkt[pkt_len++] = b;
 			// Parse on STOP 0x16 or if buffer too long (resync)
 			if (b == 0x16) {					// Stop byte per datasheet
-				parse_and_format(pkt_len);		// pkt_len = total bytes incl 0x16
+				// copy to shadow buffer and signal main loop
+				int n = pkt_len;
+				if (n > (int)sizeof(pkt_copy)) n = sizeof(pkt_copy);
+				memcpy(pkt_copy, pkt, n);
+				pkt_len_copied = n;
 				pkt_len = 0;
+				pkt_ready = true;				// minimal ISR work
 			}
 		} else {
 			pkt_len = 0;						// overflow -> resync
@@ -202,13 +232,17 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
 		// Clear common error flags (PE/FE/NE/ORE)
 		__HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_PEF | UART_CLEAR_FEF | UART_CLEAR_NEF | UART_CLEAR_OREF);
 
+		// Optional: flush RDR once after ORE if needed
+		// volatile uint32_t tmp = huart->Instance->RDR; void(tmp);
+
 		// Re-arm single-byte RX
 		HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
-		// Print error to PC
-		char msg[48];
-		int n = snprintf(msg, sizeof(msg), "UART1 ERR=%08X\r\n", (unsigned int)err);
-		HAL_UART_Transmit(&huart2, (uint8_t*)msg, n, 50);
+		// Record for later print
+		if (err != HAL_UART_ERROR_NONE) {
+			last_err = err;
+			err_flag = true;
+		}
 	}
 }
 
@@ -270,9 +304,23 @@ int main(void)
     /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
 	// HAL_UART_Transmit(&huart2, (uint8_t*)hb, 4, 50);		// sanity check
+	if (pkt_ready) {
+		pkt_ready = false;
+		parse_and_format(pkt_copy, pkt_len_copied);
+	}
+
+	// Print any prepared line
 	if (line_ready) {
 		line_ready = false;
 		HAL_UART_Transmit(&huart2, (uint8_t*)line_buf, (uint16_t)strlen(line_buf), 100);
+	}
+
+	// Print any UART1 error recorded by ISR
+	if (err_flag) {
+		err_flag = false;
+		char msg[48];
+		int n = snprintf(msg, sizeof(msg), "UART1 ERR=%08lX\r\n", (unsigned long)last_err);
+		HAL_UART_Transmit(&huart2, (uint8_t*)msg, (uint16_t)n, 50);
 	}
 
     // --- Passive mode example (uncomment only if you forced passive) ---
@@ -325,7 +373,9 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)	Error_Handler();
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) {
+	  Error_Handler();
+  }
 }
 
 /**
@@ -365,13 +415,13 @@ static void MX_USART1_UART_Init(void)
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 2400;
-  huart1.Init.WordLength = UART_WORDLENGTH_9B;				// 8 data + parity
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;				// 8 data + parity
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_EVEN;					// 8E1
   huart1.Init.Mode = UART_MODE_TX_RX;
   huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;  	//HEllo
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
   if (HAL_UART_Init(&huart1) != HAL_OK)
   {
@@ -423,10 +473,9 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.Mode = UART_MODE_TX_RX;
   huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;		//Hello
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
+  if (HAL_UART_Init(&huart2) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
